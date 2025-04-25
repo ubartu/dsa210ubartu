@@ -11,7 +11,7 @@ Provide actionable insights that can help improve marketing strategies and overa
 Strengthen my data science skills through the complete pipeline—from data collection and cleaning to analysis, visualization, and reporting.
 Data Source
 Primary Dataset:
-The dataset consists of hourly sales records from a coffeeshop, covering the period from January 1, 2025, to April 31, 2025. This data includes transaction details such as sales amounts, timestamps, and possibly product information.
+The dataset consists of hourly sales records from a coffeeshop, covering the period from January 1, 2025, to Februrary 31, 2025. This data includes transaction details such as sales amounts, timestamps, and possibly product information.
 
 Data Collection Method:
 The data was extracted from the coffeeshop’s point-of-sale system. It was provided in an Excel format which records sales intensity on an hourly basis.
