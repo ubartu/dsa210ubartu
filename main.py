@@ -1,159 +1,214 @@
-import pandas as pd
-import matplotlib.pyplot as plt
+#!/usr/bin/env python3
+"""
+DSA210 Coffee-Shop Traffic Analysis
+-----------------------------------
+Usage:
+    python main.py \
+        --traffic data/cleaned_coffee_shop_data.xlsx \
+        --weather data/weather_df.csv \
+        --out-dir results
+"""
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
 import numpy as np
-from data.weatherData import weather_df
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-  # Call the function to generate weather data
-# Load the cleaned coffee shop data
-df_full = pd.read_excel('data/cleaned_coffee_shop_data.xlsx')
+# ------------------------------------------------------------------------------
+# REQUIREMENTS (add these to requirements.txt)
+#
+# pandas
+# openpyxl       # for reading .xlsx
+# numpy
+# matplotlib
+# seaborn
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s %(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
 
-# Create a date column with all days in January for each hour entry
-dates = pd.date_range('2025-01-01', '2025-01-31')
-df_full = df_full.loc[df_full.index.repeat(len(dates))].reset_index(drop=True)
-df_full['date'] = dates.repeat(len(df_full) // len(dates))
+def load_cleaned_data(path: Path) -> pd.DataFrame:
+    """
+    Load pre‐cleaned coffee‐shop traffic data.
+    Supports .csv or .xlsx (requires openpyxl).
+    Must contain at least columns ['hour','check_count'].
+    """
+    if not path.exists():
+        logging.error(f"Traffic data file not found: {path}")
+        sys.exit(1)
 
-# Convert dates to datetime format in both DataFrames
-df_full['date'] = pd.to_datetime(df_full['date'])
-weather_df['date'] = pd.to_datetime(weather_df['date'])
+    if path.suffix.lower() == '.csv':
+        df = pd.read_csv(path)
+    elif path.suffix.lower() in {'.xls', '.xlsx'}:
+        try:
+            df = pd.read_excel(path, engine='openpyxl')
+        except ImportError:
+            logging.error("Missing openpyxl. Install it with `pip install openpyxl`.")
+            sys.exit(1)
+    else:
+        logging.error(f"Unsupported file type for traffic data: {path.suffix}")
+        sys.exit(1)
 
-# Create date string columns for merging
-df_full['date_str'] = df_full['date'].dt.date.astype(str)
-weather_df['date_str'] = weather_df['date'].dt.date.astype(str)
+    # enforce dtypes
+    df['hour'] = df['hour'].astype(int)
+    df['check_count'] = df['check_count'].astype(int)
+    return df
 
-# Merge the dataframes on date_str and hour
-merged_df = pd.merge(df_full, weather_df,
-                     on=['date_str', 'hour'],
-                     how='left',
-                     suffixes=('', '_weather'))
+def load_weather_data(path: Path) -> pd.DataFrame:
+    """
+    Load weather DataFrame from CSV (must have 'date','hour','temp','precip').
+    """
+    if not path.exists():
+        logging.error(f"Weather data file not found: {path}")
+        sys.exit(1)
 
-# Clean up duplicate columns
-merged_df = merged_df.drop(['date_weather'], axis=1)
-merged_df = merged_df.rename(columns={'temp': 'temperature', 'precip': 'precipitation'})
+    df = pd.read_csv(path, parse_dates=['date'])
+    df['hour'] = df['hour'].astype(int)
+    return df
 
-# Create flag for weekends
-merged_df['is_weekend'] = merged_df['date'].dt.dayofweek >= 5
+def expand_to_full_grid(dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """Create date×hour grid for the given dates (0–23)."""
+    dates_df = pd.DataFrame({'date': dates})
+    hours_df = pd.DataFrame({'hour': range(24)})
+    dates_df['key'] = 1
+    hours_df['key'] = 1
+    grid = dates_df.merge(hours_df, on='key').drop(columns='key')
+    return grid
 
-# Create weather effects on coffee sales (simulate realistic relationships)
-# People drink more coffee when it's cold, less when it's very hot
-merged_df['baseline_checks'] = merged_df['check_count'].copy()
+def enrich_with_traffic(grid: pd.DataFrame, traffic: pd.DataFrame) -> pd.DataFrame:
+    """Left‐join raw traffic onto the full date×hour grid, filling missing checks with 0."""
+    df = grid.merge(traffic, on='hour', how='left')
+    df['check_count'] = df['check_count'].fillna(0).astype(int)
+    # Rebuild time_slot if your downstream code uses it
+    df['time_slot'] = df.get('time_slot', df['hour'].astype(str).str.zfill(2) +
+                              ':00-' + (df['hour']+1).astype(str).str.zfill(2) + ':00')
+    return df
 
-# Temperature effect: more coffee when cold, less when hot
-merged_df['temp_effect'] = np.where(
-    merged_df['temperature'] < -5, 1.3,  # Very cold: +30% sales
-    np.where(
-        merged_df['temperature'] < 5, 1.15,  # Cold: +15% sales
-        np.where(
-            merged_df['temperature'] > 20, 0.85,  # Hot: -15% sales
-            1.0  # Normal temperatures: no effect
-        )
+def merge_weather(df: pd.DataFrame, weather: pd.DataFrame) -> pd.DataFrame:
+    """Merge in temperature & precipitation, filling missing with mean/zero."""
+    df['date_str']    = df['date'].dt.date.astype(str)
+    weather['date_str']= weather['date'].dt.date.astype(str)
+
+    merged = pd.merge(
+        df,
+        weather[['date_str','hour','temp','precip']],
+        on=['date_str','hour'],
+        how='left'
     )
-)
+    merged['temp']   = merged['temp'].fillna(merged['temp'].mean())
+    merged['precip']= merged['precip'].fillna(0)
+    return merged
 
-# Precipitation effect: more coffee when it's raining
-merged_df['precip_effect'] = np.where(
-    merged_df['precipitation'], 1.1, 1.0  # +10% sales when precipitating
-)
+def apply_weather_effects(df: pd.DataFrame, weight: float=0.2) -> pd.DataFrame:
+    """
+    Adds:
+      - 'check_orig': original check_count
+      - 'check_adj' : weather‐adjusted simulated checks
+    """
+    df = df.copy()
+    df['check_orig'] = df['check_count']
 
-# Apply the weather effects (with 20% influence)
-weather_factor = 0.2
-merged_df['check_count'] = merged_df['baseline_checks'] * (
-    (1 - weather_factor) +
-    weather_factor * merged_df['temp_effect'] * merged_df['precip_effect']
-)
-merged_df['check_count'] = merged_df['check_count'].round().astype(int)
+    df['temp_eff'] = np.select(
+        [df['temp'] < -5, df['temp'] < 5, df['temp'] > 20],
+        [1.3,        1.15,       0.85],
+        default=1.0
+    )
+    df['precip_eff'] = np.where(df['precip'] > 0, 1.1, 1.0)
 
-# --- Weekday-Hour Heatmap ---
-merged_df['weekday'] = merged_df['date'].dt.day_name()
-pivot = merged_df.pivot_table(
-    index='weekday', columns='hour', values='check_count', aggfunc='mean'
-)
+    df['check_adj'] = (
+        df['check_orig']
+        * ((1-weight) + weight * df['temp_eff'] * df['precip_eff'])
+    ).round().astype(int)
+    return df
 
-# Custom weekday order
-weekday_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-pivot = pivot.reindex(weekday_order)
+def plot_weekday_hour_heatmap(df: pd.DataFrame, out_path: Path):
+    """Save a seaborn heatmap of average checks by weekday and hour."""
+    df['weekday'] = df['date'].dt.day_name()
+    pivot = df.pivot_table(
+        index='weekday', columns='hour', values='check_count', aggfunc='mean'
+    ).reindex([
+        'Monday','Tuesday','Wednesday','Thursday',
+        'Friday','Saturday','Sunday'
+    ])
+    plt.figure(figsize=(12,6))
+    sns.heatmap(pivot, cmap='viridis', cbar_kws={'label':'Avg Checks'})
+    plt.title('Avg Coffee-Shop Checks by Weekday & Hour')
+    plt.xlabel('Hour of Day')
+    plt.ylabel('Day of Week')
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+    logging.info(f"Saved heatmap to {out_path}")
 
-plt.figure(figsize=(12, 6))
-heatmap = plt.imshow(pivot, aspect='auto', cmap='viridis')
-plt.colorbar(heatmap, label='Average Check Count')
-plt.title('Coffee Shop Traffic by Weekday and Hour')
-plt.xlabel('Hour of Day')
-plt.ylabel('Day of Week')
-plt.xticks(range(pivot.shape[1]), range(pivot.shape[1]))
-plt.yticks(range(pivot.shape[0]), pivot.index)
-plt.tight_layout()
+def plot_correlations(df: pd.DataFrame, out_temp: Path, out_prec: Path):
+    """Save bar plots of temperature/precipitation vs check_count correlations by hour."""
+    hours = range(24)
+    temp_corrs = [df[df.hour==h]['temp'].corr(df[df.hour==h]['check_count']) for h in hours]
+    precip_corrs = [df[df.hour==h]['precip'].corr(df[df.hour==h]['check_count']) for h in hours]
 
-# Save the figure
-plt.savefig('weekday_hour_heatmap.png', dpi=300, bbox_inches='tight')
+    for corrs, title, out in [
+        (temp_corrs, 'Temp vs Traffic Correlation', out_temp),
+        (precip_corrs,'Precip vs Traffic Correlation', out_prec)
+    ]:
+        plt.figure(figsize=(10,5))
+        plt.bar(hours, corrs)
+        plt.axhline(0, color='red', alpha=0.3)
+        plt.title(title)
+        plt.xlabel('Hour of Day')
+        plt.ylabel('Correlation')
+        plt.xticks(hours, rotation=90)
+        plt.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out, dpi=300)
+        plt.close()
+        logging.info(f"Saved correlation plot to {out}")
 
-# Optionally show it if running in an interactive environment
-plt.show()
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--traffic', default='data/cleaned_coffee_shop_data.xlsx',
+                   help='Path to cleaned traffic data (.csv or .xlsx)')
+    p.add_argument('--weather', default='data/weather_df.csv',
+                   help='Path to weather data CSV')
+    p.add_argument('--out-dir', default='results',
+                   help='Directory to save output figures')
+    args = p.parse_args()
 
-# --- Additional Analysis: Peak Hours ---
-# Identify peak hours by day
-peak_hours = pivot.idxmax(axis=1)
-print("\nPeak Hours by Day:")
-for day, hour in peak_hours.items():
-    print(f"{day}: {hour}:00")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(exist_ok=True)
 
-# --- Temperature Correlation Analysis ---
-# Calculate correlation between temperature and check count for each hour
-hour_temp_correlations = []
+    # Load inputs
+    traffic_df = load_cleaned_data(Path(args.traffic))
+    weather_df = load_weather_data(Path(args.weather))
 
-for hour in range(24):
-    hour_data = merged_df[merged_df['hour'] == hour]
-    if len(hour_data) > 5:  # Need enough data points
-        temp_corr = hour_data['temperature'].corr(hour_data['check_count'])
-        hour_temp_correlations.append(temp_corr)
-    else:
-        hour_temp_correlations.append(np.nan)
+    # Build full date×hour grid for January 2025
+    date_index = pd.date_range('2025-01-01','2025-01-31', freq='D')
+    grid       = expand_to_full_grid(date_index)
 
-# Plot temperature correlations
-plt.figure(figsize=(10, 5))
-plt.bar(range(24), hour_temp_correlations)
-plt.axhline(y=0, color='r', linestyle='-', alpha=0.3)
-plt.title('Correlation Between Temperature and Coffee Shop Traffic by Hour')
-plt.xlabel('Hour of Day')
-plt.ylabel('Correlation Coefficient')
-plt.xticks(range(0, 24, 2))
-plt.grid(axis='y', alpha=0.3)
-plt.tight_layout()
-plt.savefig('temp_correlation.png', dpi=300, bbox_inches='tight')
-plt.show()
+    # Merge & enrich
+    df_full     = enrich_with_traffic(grid, traffic_df)
+    df_weather  = merge_weather(df_full, weather_df)
+    df_features = apply_weather_effects(df_weather, weight=0.2)
 
-# --- Precipitation Correlation Analysis ---
-# Calculate correlation between precipitation and check count for each hour
-hour_precip_correlations = []
+    # Plot & save
+    plot_weekday_hour_heatmap(
+        df_features, out_dir / 'weekday_hour_heatmap.png'
+    )
+    plot_correlations(
+        df_features,
+        out_dir / 'temp_correlation.png',
+        out_dir / 'precip_correlation.png'
+    )
 
-for hour in range(24):
-    hour_data = merged_df[merged_df['hour'] == hour]
-    if len(hour_data) > 5:
-        # For precipitation (which is boolean), use point-biserial correlation
-        # This is automatically handled by pandas corr()
-        precip_corr = hour_data['precipitation'].corr(hour_data['check_count'])
-        hour_precip_correlations.append(precip_corr)
-    else:
-        hour_precip_correlations.append(np.nan)
+    logging.info("All done!")
 
-# Plot precipitation correlations
-plt.figure(figsize=(10, 5))
-plt.bar(range(24), hour_precip_correlations)
-plt.axhline(y=0, color='r', linestyle='-', alpha=0.3)
-plt.title('Correlation Between Precipitation and Coffee Shop Traffic by Hour')
-plt.xlabel('Hour of Day')
-plt.ylabel('Correlation Coefficient')
-plt.xticks(range(0, 24, 2))
-plt.grid(axis='y', alpha=0.3)
-plt.tight_layout()
-plt.savefig('precip_correlation.png', dpi=300, bbox_inches='tight')
-plt.show()
-
-# --- Scatter plot of temperature vs. check count ---
-plt.figure(figsize=(10, 6))
-plt.scatter(merged_df['temperature'], merged_df['check_count'], alpha=0.3)
-plt.title('Temperature vs Coffee Shop Traffic')
-plt.xlabel('Temperature (°C)')
-plt.ylabel('Check Count')
-plt.grid(alpha=0.3)
-plt.tight_layout()
-plt.savefig('temp_scatter.png', dpi=300, bbox_inches='tight')
-plt.show()
+if __name__ == '__main__':
+    main()

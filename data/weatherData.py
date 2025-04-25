@@ -29,4 +29,6 @@ for date in dates:
 
 # Create DataFrame
 weather_df = pd.DataFrame(weather_data)
+weather_df.to_csv('weather_df.csv', index=False)
+print("Saved weather_df.csv with", len(weather_df), "rows.")
 print(weather_df.head())
