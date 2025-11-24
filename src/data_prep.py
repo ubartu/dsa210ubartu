@@ -1,6 +1,6 @@
 # src/data_prep.py
 
-from typing import Tuple, Optional, List
+from typing import Optional
 
 import pandas as pd
 from pathlib import Path
@@ -40,65 +40,57 @@ CITIES_FILTER = [c for c, _ in STATION_TO_CITY_STATE.values()]
 STATES_FILTER = [s for _, s in STATION_TO_CITY_STATE.values()]
 ANALYSIS_YEARS = (2016, 2021)
 ACCIDENTS_SUBSET = DATA_RAW / "US_Accidents_10cities_2016_2021.parquet"
+ACCIDENTS_SUBSET_CSV = DATA_RAW / "US_Accidents_10cities_2016_2021.csv"
 
 
 
 def build_accidents_subset(accidents_csv_path: Path) -> pd.DataFrame:
-    """
-    Stream US_Accidents_March23.csv in chunks, keep only:
-      - 2016–2021
-      - the 10 cities we have weather for
-      - a few needed columns
-    Save as a small Parquet file and return it.
-    """
-    if ACCIDENTS_SUBSET.exists():
-        print(f"[accidents] Using cached subset: {ACCIDENTS_SUBSET}")
-        return pd.read_parquet(ACCIDENTS_SUBSET)
+    if ACCIDENTS_SUBSET_CSV.exists():
+        print(f"[accidents] Using cached subset: {ACCIDENTS_SUBSET_CSV}")
+        return pd.read_csv(
+            ACCIDENTS_SUBSET_CSV,
+            parse_dates=["Start_Time", "Date"]  # important for Date logic
+        )
 
     print(f"[accidents] Building subset from {accidents_csv_path} …")
 
     usecols = ["ID", "Start_Time", "City", "State", "Severity"]
+    year_strings = {str(y) for y in ANALYSIS_YEARS}
+
     chunks = pd.read_csv(
         accidents_csv_path,
         usecols=usecols,
-        chunksize=250_000,          # adjust up/down if needed
+        chunksize=250_000,
         low_memory=False,
     )
 
     kept_chunks = []
-    year_strings = {str(y) for y in ANALYSIS_YEARS}
 
     for i, chunk in enumerate(chunks, start=1):
-        # quick string-based year filter (much cheaper than full datetime on all rows)
         years = chunk["Start_Time"].str.slice(0, 4)
         mask_year = years.isin(year_strings)
 
         mask_city = chunk["City"].isin(CITIES_FILTER)
         mask_state = chunk["State"].isin(STATES_FILTER)
 
-        mask = mask_year & mask_city & mask_state
-        sub = chunk.loc[mask].copy()
-
+        sub = chunk.loc[mask_year & mask_city & mask_state].copy()
         if sub.empty:
             continue
 
-        # now pay the cost of datetime only for kept rows
         sub["Start_Time"] = pd.to_datetime(sub["Start_Time"], errors="coerce")
         sub = sub.dropna(subset=["Start_Time"])
-
         sub["Date"] = sub["Start_Time"].dt.normalize()
 
         kept_chunks.append(sub)
-
         print(f"[accidents] processed chunk {i}, kept {len(sub)} rows")
 
     if not kept_chunks:
-        raise RuntimeError("No rows matched filters (years + cities). Check filters.")
+        raise RuntimeError("No rows matched filters.")
 
     df_sub = pd.concat(kept_chunks, ignore_index=True)
-    df_sub.to_parquet(ACCIDENTS_SUBSET, index=False)
+    df_sub.to_csv(ACCIDENTS_SUBSET_CSV, index=False)
+    print(f"[accidents] Subset saved to {ACCIDENTS_SUBSET_CSV} with shape {df_sub.shape}")
 
-    print(f"[accidents] Subset saved to {ACCIDENTS_SUBSET} with shape {df_sub.shape}")
     return df_sub
 
 
@@ -373,9 +365,10 @@ def main() -> None:
     df_merged = engineer_weather_flags(df_merged)
     df_merged = create_lag_features(df_merged)
 
-    out_path = DATA_PROCESSED / "city_day_merged.parquet"
-    df_merged.to_parquet(out_path, index=False)
+    out_path = DATA_PROCESSED / "city_day_merged.csv"
+    df_merged.to_csv(out_path, index=False)
     print(f"✅ Saved merged dataset to {out_path} with shape {df_merged.shape}")
+
 
 
 
